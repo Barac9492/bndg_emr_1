@@ -31,7 +31,8 @@ export function TriageModal({ open, onClose }: Props) {
         setLoading(true);
         setResult(null);
         try {
-            const res = await fetch('http://localhost:8000/api/recommend', {
+            const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api';
+            const res = await fetch(`${API}/recommend`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ ktas, specialty }),

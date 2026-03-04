@@ -26,7 +26,7 @@ const SPECIALTY_LABELS: Record<string, string> = {
   pediatric: '소아', obstetrics: '산부인과', internal: '내과',
 };
 
-const API = 'http://localhost:8000/api';
+const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api';
 
 export default function HomePage() {
   const [hospitals, setHospitals] = useState<Hospital[]>([]);

@@ -2,29 +2,30 @@
 hospitals.py — /api/hospitals router
 """
 
-from fastapi import APIRouter
-from services.data_engine import get_hospital_statuses
+from fastapi import APIRouter, Request
+from services.data_engine import get_hospital_statuses, get_osint_alerts
 from services.forecaster import adjust_status_index, forecast_demand_narrative
-from services.data_engine import get_osint_alerts
 
 router = APIRouter()
 
 
 @router.get("/hospitals")
-def hospitals():
-    alerts = get_osint_alerts()
-    statuses = get_hospital_statuses()
+async def hospitals(request: Request):
+    http = request.app.state.http_client
+    alerts = await get_osint_alerts(http_client=http)
+    statuses = await get_hospital_statuses(http_client=http)
+
     for h in statuses:
-        h["status_index"] = adjust_status_index(h["status_index"], alerts)
-        # Re-evaluate status label after adjustment
+        h["status_index"] = await adjust_status_index(h["status_index"], alerts, http_client=http)
         if h["status_index"] >= 60:
             h["status"] = "green"
         elif h["status_index"] >= 30:
             h["status"] = "amber"
         else:
             h["status"] = "red"
+
     return {
         "hospitals": statuses,
-        "system_narrative": forecast_demand_narrative(alerts),
+        "system_narrative": await forecast_demand_narrative(alerts, http_client=http),
         "total_hospitals": len(statuses),
     }

@@ -1,13 +1,20 @@
 """
 data_engine.py
-Simulates real-time hospital status and OSINT alert data for the 분당 골든패스 MVP.
-In production, the hospital data would come from the E-Gen (응급의료포털) API.
+Hospital status and OSINT alert data for 분당 골든패스.
+Uses real APIs (E-Gen, Traffic) when keys are configured, falls back to mock data.
 """
 
+import logging
 import random
-import math
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+from services.api_clients.egen import EGenClient
+from services.api_clients.traffic import TrafficClient
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Static hospital registry
@@ -26,7 +33,7 @@ HOSPITALS: List[Dict[str, Any]] = [
         "total_beds": 40,
         "equipment": ["CT", "MRI", "ECMO", "Cath-Lab"],
         "level": "권역응급의료센터",
-        "base_load": 0.78,   # chronically busy flagship
+        "base_load": 0.78,
     },
     {
         "id": "cha",
@@ -68,7 +75,7 @@ HOSPITALS: List[Dict[str, Any]] = [
         "total_beds": 35,
         "equipment": ["CT", "MRI", "Cath-Lab", "ECMO"],
         "level": "지역응급의료센터",
-        "base_load": 0.42,   # further out — tends to have space
+        "base_load": 0.42,
     },
     {
         "id": "snmc",
@@ -82,7 +89,7 @@ HOSPITALS: List[Dict[str, Any]] = [
         "total_beds": 22,
         "equipment": ["CT", "X-Ray", "MRI"],
         "level": "지역응급의료센터",
-        "base_load": 0.38,   # public hospital with good surge capacity
+        "base_load": 0.38,
     },
     {
         "id": "kcha",
@@ -101,7 +108,7 @@ HOSPITALS: List[Dict[str, Any]] = [
 ]
 
 # ---------------------------------------------------------------------------
-# OSINT alert pool (simulated)
+# OSINT alert pool (mock fallback)
 # ---------------------------------------------------------------------------
 
 OSINT_POOL = [
@@ -118,15 +125,15 @@ OSINT_POOL = [
 ]
 
 # ---------------------------------------------------------------------------
-# Realistic simulation with time-of-day weighting
+# Time-of-day helpers
 # ---------------------------------------------------------------------------
 
 def _time_pressure() -> float:
     """Returns a multiplier (0.6–1.4) based on hour of day."""
     hour = datetime.now().hour
-    if 8 <= hour <= 10 or 18 <= hour <= 21:   # peak
+    if 8 <= hour <= 10 or 18 <= hour <= 21:
         return 1.35
-    elif 0 <= hour <= 5:                        # quiet night
+    elif 0 <= hour <= 5:
         return 0.65
     else:
         return 1.0
@@ -138,29 +145,56 @@ def _seed_from_time(salt: int = 0) -> int:
     return (t.year * 10000 + t.month * 100 + t.day) * 10000 + (t.hour * 60 + t.minute) * 2 + (t.second // 30) + salt
 
 
-def get_hospital_statuses() -> List[Dict[str, Any]]:
-    tod_pressure = _time_pressure()  # 0.65 – 1.35
+# ---------------------------------------------------------------------------
+# Hospital status — async with E-Gen fallback to mock
+# ---------------------------------------------------------------------------
+
+async def get_hospital_statuses(http_client: Optional[httpx.AsyncClient] = None) -> List[Dict[str, Any]]:
+    """
+    Get hospital statuses. Uses E-Gen API if available, otherwise mock data.
+    """
+    egen_data = None
+    if http_client:
+        egen_client = EGenClient(http_client)
+        egen_data = await egen_client.fetch_hospital_beds()
+
+    if egen_data:
+        logger.info("Using E-Gen live data for %d hospitals", len(egen_data))
+        return _build_statuses_from_egen(egen_data)
+    else:
+        return _build_statuses_mock()
+
+
+def _build_statuses_from_egen(egen_data: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build hospital statuses from real E-Gen API data."""
     results = []
+    for h in HOSPITALS:
+        hid = h["id"]
+        api = egen_data.get(hid)
 
-    for i, h in enumerate(HOSPITALS):
-        rng = random.Random(_seed_from_time(salt=i * 17))
+        if api:
+            # Real data: compute occupancy from available ER beds vs total
+            hvec = api.get("hvec", 0)
+            total = h["total_beds"]
+            available_beds = max(0, hvec)
+            occupancy = max(0.05, min(0.97, 1 - (available_beds / total) if total > 0 else 0.80))
+            status_index = round(max(3, min(98, (1 - occupancy) * 100)))
+            data_source = "egen"
 
-        # Each hospital has its own baseline load (encoded in static data).
-        # Time-of-day pressure only shifts occupancy by ±20%, not multiplies wholesale.
-        base_load: float = h.get("base_load", 0.60)
-        tod_delta = (tod_pressure - 1.0) * 0.20   # maps 0.65–1.35 → -0.07 to +0.07
-        noise = rng.uniform(-0.08, 0.08)
-        occupancy = max(0.05, min(0.97, base_load + tod_delta + noise))
-        available_beds = max(0, round(h["total_beds"] * (1 - occupancy)))
-
-        # Status Index: 30-min acceptance probability
-        status_index = round(max(3, min(98, (1 - occupancy) * 100)))
-
-        # Trend
-        prev_rng = random.Random(_seed_from_time(salt=i * 17) - 1)
-        prev_noise = prev_rng.uniform(-0.08, 0.08)
-        prev_occ = max(0.05, min(0.97, base_load + tod_delta + prev_noise))
-        trend = "improving" if occupancy < prev_occ - 0.02 else "worsening" if occupancy > prev_occ + 0.02 else "stable"
+            # Equipment availability from API
+            equipment = list(h["equipment"])
+            if api.get("hvctayn") == "N" and "CT" in equipment:
+                equipment.remove("CT")
+            if api.get("hvmriayn") == "N" and "MRI" in equipment:
+                equipment.remove("MRI")
+        else:
+            # Fallback to mock for this specific hospital
+            mock = _mock_single_hospital(h, HOSPITALS.index(h))
+            available_beds = mock["available_beds"]
+            occupancy = mock["occupancy_pct"] / 100
+            status_index = mock["status_index"]
+            equipment = h["equipment"]
+            data_source = "mock"
 
         # Status label
         if status_index >= 60:
@@ -170,10 +204,20 @@ def get_hospital_statuses() -> List[Dict[str, Any]]:
         else:
             status = "red"
 
-        # On-call specialties (randomly 1–2 offline)
+        # Trend: compare with base load (simplified when using real data)
+        base_occ = h.get("base_load", 0.60)
+        if occupancy < base_occ - 0.05:
+            trend = "improving"
+        elif occupancy > base_occ + 0.05:
+            trend = "worsening"
+        else:
+            trend = "stable"
+
+        # Specialties (keep all available when using real data)
         all_specs = h["specialties"][:]
+        rng = random.Random(_seed_from_time(salt=HOSPITALS.index(h) * 17))
         offline_count = rng.randint(0, min(1, len(all_specs) - 1))
-        offline_specs = rng.sample(all_specs, offline_count)
+        offline_specs = rng.sample(all_specs, offline_count) if data_source == "mock" else []
         available_specs = [s for s in all_specs if s not in offline_specs]
 
         results.append({
@@ -185,13 +229,115 @@ def get_hospital_statuses() -> List[Dict[str, Any]]:
             "trend": trend,
             "available_specialties": available_specs,
             "offline_specialties": offline_specs,
+            "equipment_available": equipment,
+            "data_source": data_source,
             "last_updated": datetime.now().isoformat(),
         })
 
     return results
 
 
-def get_osint_alerts(count: int = 8) -> List[Dict[str, Any]]:
+def _build_statuses_mock() -> List[Dict[str, Any]]:
+    """Build hospital statuses from mock simulation (original logic)."""
+    tod_pressure = _time_pressure()
+    results = []
+
+    for i, h in enumerate(HOSPITALS):
+        result = _mock_single_hospital(h, i)
+        result["data_source"] = "mock"
+        results.append(result)
+
+    return results
+
+
+def _mock_single_hospital(h: Dict[str, Any], index: int) -> Dict[str, Any]:
+    """Generate mock status for a single hospital."""
+    tod_pressure = _time_pressure()
+    rng = random.Random(_seed_from_time(salt=index * 17))
+
+    base_load: float = h.get("base_load", 0.60)
+    tod_delta = (tod_pressure - 1.0) * 0.20
+    noise = rng.uniform(-0.08, 0.08)
+    occupancy = max(0.05, min(0.97, base_load + tod_delta + noise))
+    available_beds = max(0, round(h["total_beds"] * (1 - occupancy)))
+    status_index = round(max(3, min(98, (1 - occupancy) * 100)))
+
+    # Trend
+    prev_rng = random.Random(_seed_from_time(salt=index * 17) - 1)
+    prev_noise = prev_rng.uniform(-0.08, 0.08)
+    prev_occ = max(0.05, min(0.97, base_load + tod_delta + prev_noise))
+    trend = "improving" if occupancy < prev_occ - 0.02 else "worsening" if occupancy > prev_occ + 0.02 else "stable"
+
+    # Status label
+    if status_index >= 60:
+        status = "green"
+    elif status_index >= 30:
+        status = "amber"
+    else:
+        status = "red"
+
+    # Specialties
+    all_specs = h["specialties"][:]
+    offline_count = rng.randint(0, min(1, len(all_specs) - 1))
+    offline_specs = rng.sample(all_specs, offline_count)
+    available_specs = [s for s in all_specs if s not in offline_specs]
+
+    return {
+        **h,
+        "available_beds": available_beds,
+        "occupancy_pct": round(occupancy * 100, 1),
+        "status_index": status_index,
+        "status": status,
+        "trend": trend,
+        "available_specialties": available_specs,
+        "offline_specialties": offline_specs,
+        "last_updated": datetime.now().isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# OSINT alerts — async with Traffic API fallback to mock
+# ---------------------------------------------------------------------------
+
+async def get_osint_alerts(
+    count: int = 8,
+    http_client: Optional[httpx.AsyncClient] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Get OSINT alerts. Combines real traffic incidents with mock SNS/weather/event alerts.
+    """
+    alerts: List[Dict[str, Any]] = []
+
+    # Try real traffic data
+    if http_client:
+        traffic_client = TrafficClient(http_client)
+        incidents = await traffic_client.fetch_incidents()
+        if incidents:
+            now = datetime.now()
+            for i, inc in enumerate(incidents[:count]):
+                alerts.append({
+                    "id": f"traffic-live-{i}",
+                    "type": inc["type"],
+                    "severity": inc["severity"],
+                    "message": inc["message"],
+                    "timestamp": inc["timestamp"] or now.isoformat(),
+                    "minutes_ago": inc["minutes_ago"],
+                    "road_name": inc.get("road_name", ""),
+                    "data_source": "traffic_api",
+                })
+
+    # Fill remaining slots with mock alerts
+    remaining = count - len(alerts)
+    if remaining > 0:
+        mock_alerts = _mock_osint_alerts(remaining)
+        alerts.extend(mock_alerts)
+
+    alerts.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    return alerts[:count]
+
+
+def _mock_osint_alerts(count: int) -> List[Dict[str, Any]]:
+    """Generate mock OSINT alerts (original logic)."""
     rng = random.Random(_seed_from_time(salt=999))
     chosen = rng.choices(OSINT_POOL, k=count)
     alerts = []
@@ -205,7 +351,7 @@ def get_osint_alerts(count: int = 8) -> List[Dict[str, Any]]:
             "message": item["msg"],
             "timestamp": ts.isoformat(),
             "minutes_ago": round((now - ts).total_seconds() / 60),
+            "data_source": "mock",
         })
-    # Sort newest first
     alerts.sort(key=lambda x: x["timestamp"], reverse=True)
     return alerts

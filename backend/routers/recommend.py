@@ -4,20 +4,13 @@ Smart Triage: given KTAS level + specialty, rank hospitals by acceptance probabi
 """
 
 import math
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
-from typing import Literal, List, Dict, Any
+from typing import List, Dict, Any
 from services.data_engine import get_hospital_statuses, get_osint_alerts, HOSPITALS
 from services.forecaster import adjust_status_index
 
 router = APIRouter()
-
-# Rough ETA from Bundang central (판교) in minutes — overridden by real GPS in production
-BASE_ETA: Dict[str, int] = {
-    "bsuh": 8,
-    "cha":  6,
-    "jss": 14,
-}
 
 SPECIALTY_MAP = {
     "trauma":     ["trauma"],
@@ -26,14 +19,14 @@ SPECIALTY_MAP = {
     "pediatric":  ["pediatric"],
     "obstetrics": ["obstetrics"],
     "internal":   ["internal"],
-    "general":    [],  # any hospital
+    "general":    [],
 }
 
 
 class TriageRequest(BaseModel):
-    ktas: int                        # 1 = most critical, 5 = least
-    specialty: str = "general"       # "trauma", "cardiac", "neuro", etc.
-    location_lat: float = 37.3700   # default: 판교IC
+    ktas: int
+    specialty: str = "general"
+    location_lat: float = 37.3700
     location_lng: float = 127.1050
 
 
@@ -47,9 +40,10 @@ def _haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 
 
 @router.post("/recommend")
-def recommend(req: TriageRequest):
-    alerts = get_osint_alerts()
-    statuses = {h["id"]: h for h in get_hospital_statuses()}
+async def recommend(req: TriageRequest, request: Request):
+    http = request.app.state.http_client
+    alerts = await get_osint_alerts(http_client=http)
+    statuses = {h["id"]: h for h in await get_hospital_statuses(http_client=http)}
 
     needed_specs = SPECIALTY_MAP.get(req.specialty, [])
 
@@ -57,26 +51,21 @@ def recommend(req: TriageRequest):
     for h in HOSPITALS:
         hid = h["id"]
         status = statuses[hid]
-        adjusted_si = adjust_status_index(status["status_index"], alerts)
+        adjusted_si = await adjust_status_index(status["status_index"], alerts, http_client=http)
 
-        # Specialty check
         has_specialty = (not needed_specs) or any(s in status["available_specialties"] for s in needed_specs)
 
-        # Distance-based ETA (approximation)
         dist_km = _haversine(req.location_lat, req.location_lng, h["lat"], h["lng"])
-        eta_min = round(dist_km * 1.6 + 2)  # rough urban driving factor
+        eta_min = round(dist_km * 1.6 + 2)
 
-        # KTAS urgency: for KTAS 1-2, penalise hospitals with low status_index heavily
         ktas_weight = 1.0
         if req.ktas <= 2 and adjusted_si < 40:
-            ktas_weight = 0.5  # significantly penalise near-full hospitals for critical patients
+            ktas_weight = 0.5
 
-        # Composite score: higher is better
         score = (adjusted_si * ktas_weight) - (eta_min * 1.5)
         if not has_specialty:
-            score -= 40  # heavy penalty for missing specialty
+            score -= 40
 
-        # Status label
         if adjusted_si >= 60:
             status_label = "green"
         elif adjusted_si >= 30:
@@ -101,7 +90,6 @@ def recommend(req: TriageRequest):
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
 
-    # Tag top recommendation
     if ranked:
         ranked[0]["is_top_pick"] = True
 

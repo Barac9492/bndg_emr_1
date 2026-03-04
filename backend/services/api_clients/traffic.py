@@ -59,9 +59,10 @@ class TrafficClient:
             return None
 
     async def _fetch(self) -> Optional[List[Dict[str, Any]]]:
-        url = f"{self._settings.traffic_base_url}/getTIIS"
+        # apiKey must not be double-encoded — build URL with raw key
+        base = f"{self._settings.traffic_base_url}/getTIIS"
+        url = f"{base}?apiKey={self._settings.traffic_api_key}"
         params = {
-            "apiKey": self._settings.traffic_api_key,
             "type": "all",
             "eventType": "all",
             "getType": "json",

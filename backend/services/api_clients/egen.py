@@ -19,9 +19,9 @@ HOSPITAL_NAME_MAP: Dict[str, str] = {
     "bsuh": "분당서울대학교병원",
     "cha": "분당차병원",
     "jss": "제생병원",
-    "ysei": "용인세브란스병원",
+    "ysei": "연세대학교의과대학용인세브란스병원",
     "snmc": "성남시의료원",
-    "kcha": "강남차병원",
+    "kcha": "강남차병원",  # Not in E-Gen — uses mock fallback
 }
 
 # Region queries needed to cover all our hospitals
@@ -29,8 +29,7 @@ REGION_QUERIES = [
     {"STAGE1": "경기도", "STAGE2": "성남시 분당구"},
     {"STAGE1": "경기도", "STAGE2": "성남시 수정구"},
     {"STAGE1": "경기도", "STAGE2": "성남시 중원구"},
-    {"STAGE1": "경기도", "STAGE2": "용인시 처인구"},
-    {"STAGE1": "서울특별시", "STAGE2": "강남구"},
+    {"STAGE1": "경기도", "STAGE2": "용인시 기흥구"},
 ]
 
 
@@ -71,9 +70,10 @@ class EGenClient:
 
     async def _fetch_region(self, stage1: str, stage2: str) -> List[ET.Element]:
         """Fetch a single region's emergency room data."""
-        url = f"{self._settings.egen_base_url}/getEmrrmRltmUsefulSckbdInfoInqire"
+        # serviceKey must not be double-encoded — build URL with raw key
+        base = f"{self._settings.egen_base_url}/getEmrrmRltmUsefulSckbdInfoInqire"
+        url = f"{base}?serviceKey={self._settings.egen_api_key}"
         params = {
-            "serviceKey": self._settings.egen_api_key,
             "STAGE1": stage1,
             "STAGE2": stage2,
             "pageNo": "1",
@@ -97,7 +97,7 @@ class EGenClient:
         result: Dict[str, Dict[str, Any]] = {}
 
         for item in items:
-            duty_name = item.findtext("dutyname", "").strip()
+            duty_name = (item.findtext("dutyName") or item.findtext("dutyname") or "").strip()
             # Try exact match first, then substring
             hospital_id = name_to_id.get(duty_name)
             if not hospital_id:
@@ -121,7 +121,7 @@ class EGenClient:
                 "hvmriayn": item.findtext("hvmriayn", "N"), # MRI available
                 "hvventiayn": item.findtext("hvventiayn", "N"),  # Ventilator
                 "hvidate": item.findtext("hvidate", ""),    # Last update time
-                "dutytel3": item.findtext("dutytel3", ""),   # ER phone
+                "dutytel3": item.findtext("dutyTel3") or item.findtext("dutytel3") or "",
             }
 
         return result

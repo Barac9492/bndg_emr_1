@@ -73,9 +73,10 @@ class KMAClient:
         base_date = base_dt.strftime("%Y%m%d")
         base_time = base_dt.strftime("%H00")
 
-        url = f"{self._settings.kma_base_url}/getUltraSrtNcst"
+        # serviceKey must not be double-encoded — build URL with raw key
+        base = f"{self._settings.kma_base_url}/getUltraSrtNcst"
+        url = f"{base}?serviceKey={self._settings.kma_api_key}"
         params = {
-            "serviceKey": self._settings.kma_api_key,
             "pageNo": "1",
             "numOfRows": "10",
             "dataType": "JSON",
